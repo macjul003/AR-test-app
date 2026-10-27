@@ -62,12 +62,28 @@ enum SpawnChoice: Hashable {
     case usdz(String)
 }
 
+/// What the app tells the user about the camera and the room.
+enum ScanStatus: Equatable {
+    case scanning              // tracking is fine, but no surface under the reticle yet
+    case ready                 // a surface is under the reticle
+    case limited(String)       // ARKit says tracking is degraded; the string is the reason
+
+    var hint: String {
+        switch self {
+        case .scanning: return "Move the phone to scan"
+        case .ready: return "Tap to place"
+        case .limited(let why): return why.isEmpty ? "Tracking limited" : "Tracking limited · \(why)"
+        }
+    }
+}
+
 final class SceneModel: ObservableObject {
     // What to spawn
     @Published var choice: SpawnChoice = .primitive(.cube)
     @Published var colorIndex = 0
     @Published var showMesh = true
     @Published private(set) var count = 0
+    @Published private(set) var status: ScanStatus = .scanning
 
     // Hand tracking (screen points)
     @Published var handTracking = false
@@ -91,6 +107,12 @@ final class SceneModel: ObservableObject {
     private var cache: [String: Entity] = [:]   // load from disk once, clone after
     private let maxObjects = 40
 
+    // Reticle, placement and selection (updated every frame, not published)
+    private var reticle: AnchorEntity?
+    private var selectionRing: AnchorEntity?
+    private var selected: ModelEntity?
+    private var placementPosition: SIMD3<Float>?
+
     // Grabbing
     private var grabbed: ModelEntity?
     private var grabPoint: CGPoint = .zero          // ring position on screen
@@ -102,7 +124,154 @@ final class SceneModel: ObservableObject {
         return false
     }
 
+    // MARK: Reticle and selection ring
+
+    /// A flat ring in the XZ plane, made of triangles. Drawn from both sides so it never disappears.
+    private static func ringMesh(inner: Float, outer: Float, segments: Int = 64) -> MeshResource {
+        var positions: [SIMD3<Float>] = []
+        var indices: [UInt32] = []
+        for i in 0..<segments {
+            let a = Float(i) / Float(segments) * 2 * .pi
+            positions.append(SIMD3<Float>(cos(a) * inner, 0, sin(a) * inner))   // even index: inner edge
+            positions.append(SIMD3<Float>(cos(a) * outer, 0, sin(a) * outer))   // odd index: outer edge
+        }
+        for i in 0..<segments {
+            let i0 = UInt32(i * 2)
+            let o0 = i0 + 1
+            let next = UInt32(((i + 1) % segments) * 2)
+            let i1 = next
+            let o1 = next + 1
+            // One quad = two triangles, added in both windings (visible from above and below)
+            indices += [i0, o0, o1, i0, o1, i1]
+            indices += [i0, o1, o0, i0, i1, o1]
+        }
+        var desc = MeshDescriptor(name: "ring")
+        desc.positions = MeshBuffer(positions)
+        desc.primitives = .triangles(indices)
+        return (try? MeshResource.generate(from: [desc])) ?? MeshResource.generateBox(size: 0.01)
+    }
+
+    /// Called once from makeUIView. Creates the two overlay entities, hidden until needed.
+    func installOverlays() {
+        guard let arView else { return }
+
+        // Reticle: a 12 cm ring, about the size of a cube
+        let reticleRing = ModelEntity(mesh: Self.ringMesh(inner: 0.052, outer: 0.06),
+                                      materials: [UnlitMaterial(color: .white)])
+        let reticleAnchor = AnchorEntity(world: .zero)
+        reticleAnchor.addChild(reticleRing)
+        reticleAnchor.isEnabled = false
+        arView.scene.addAnchor(reticleAnchor)
+        reticle = reticleAnchor
+
+        // Selection ring: radius 1, scaled to fit whichever object is selected
+        let selectionColor = UIColor(red: 1.0, green: 0.8, blue: 0.2, alpha: 1.0)
+        let ring = ModelEntity(mesh: Self.ringMesh(inner: 0.88, outer: 1.0),
+                               materials: [UnlitMaterial(color: selectionColor)])
+        let ringAnchor = AnchorEntity(world: .zero)
+        ringAnchor.addChild(ring)
+        ringAnchor.isEnabled = false
+        arView.scene.addAnchor(ringAnchor)
+        selectionRing = ringAnchor
+    }
+
+    /// Called every frame (60 Hz) from the AR session delegate.
+    func updateFrame(_ frame: ARFrame, dt: Float) {
+        updateGrab(dt: dt)
+        updateReticle(frame: frame, dt: dt)
+        updateSelection()
+    }
+
+    private func updateReticle(frame: ARFrame, dt: Float) {
+        guard let arView, let reticle else { return }
+
+        // 1. How good is tracking right now?
+        var hit: ARRaycastResult?
+        var newStatus: ScanStatus
+
+        switch frame.camera.trackingState {
+        case .normal:
+            // 2. Tracking is fine: is there a surface under the middle of the screen?
+            let center = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+            hit = arView.raycast(from: center, allowing: .existingPlaneGeometry, alignment: .horizontal).first
+               ?? arView.raycast(from: center, allowing: .estimatedPlane, alignment: .horizontal).first
+
+            // Ignore hits more than 3 m away: they are guesses and jitter badly
+            if let h = hit {
+                let c = frame.camera.transform.columns.3
+                let p = h.worldTransform.columns.3
+                let d = distance(SIMD3<Float>(c.x, c.y, c.z), SIMD3<Float>(p.x, p.y, p.z))
+                if d > 3 { hit = nil }
+            }
+            newStatus = hit == nil ? .scanning : .ready
+
+        case .limited(let reason):
+            switch reason {
+            case .initializing:       newStatus = .limited("starting up")
+            case .excessiveMotion:    newStatus = .limited("slow down")
+            case .insufficientFeatures: newStatus = .limited("low detail")
+            case .relocalizing:       newStatus = .limited("relocalizing")
+            @unknown default:         newStatus = .limited("")
+            }
+
+        case .notAvailable:
+            newStatus = .limited("")
+        }
+
+        // Publishing 60 times a second would redraw the UI constantly, so only on change
+        if status != newStatus { status = newStatus }
+
+        // 3. Move the reticle onto the surface
+        guard let hit else {
+            reticle.isEnabled = false
+            placementPosition = nil
+            return
+        }
+
+        let m = hit.worldTransform
+        let surface = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
+        let lifted = surface + SIMD3<Float>(0, 0.003, 0)       // 3 mm up, so it doesn't z-fight the surface
+
+        if reticle.isEnabled {
+            let k = 1 - exp(-dt * 20)                           // glide instead of jitter
+            reticle.position = reticle.position + (lifted - reticle.position) * k
+        } else {
+            reticle.position = lifted                           // first frame: snap, don't glide from the origin
+        }
+        reticle.orientation = Transform(matrix: m).rotation
+        reticle.scale = SIMD3<Float>(repeating: 1 + 0.05 * sin(Float(frame.timestamp) * 4))   // gentle pulse
+        reticle.isEnabled = true
+
+        placementPosition = surface
+    }
+
+    private func updateSelection() {
+        guard let selectionRing else { return }
+        // The object may have been removed by undo, clear, or the object cap
+        guard let body = selected, body.scene != nil else {
+            selected = nil
+            selectionRing.isEnabled = false
+            return
+        }
+
+        // Put a ring on the ground under the object, sized to its footprint
+        let b = body.visualBounds(relativeTo: nil)
+        let radius = max(b.extents.x, b.extents.z) * 0.75 + 0.01
+        selectionRing.position = SIMD3<Float>(b.center.x, b.center.y - b.extents.y / 2 + 0.004, b.center.z)
+        selectionRing.scale = SIMD3<Float>(repeating: radius)
+        selectionRing.isEnabled = true
+    }
+
     // MARK: Spawning
+
+    /// Called by a tap that isn't on an object. Places at the reticle, or warns if there's no surface.
+    func placeAtReticle() {
+        guard let position = placementPosition else {
+            Haptics.warn()
+            return
+        }
+        spawn(at: position)
+    }
 
     func spawn(at position: SIMD3<Float>) {
         guard arView != nil else { return }
@@ -144,7 +313,12 @@ final class SceneModel: ObservableObject {
             shapes = [.generateBox(size: [0.16, 0.05, 0.08])]
         }
         let material = SimpleMaterial(color: UIColor(palette[colorIndex]), isMetallic: false)
-        let body = ModelEntity(mesh: mesh, materials: [material])
+
+        // The visible mesh rides inside a physics wrapper, the same layout models use.
+        // That lets the pop-in animation scale the visual without touching the physics body.
+        let visual = ModelEntity(mesh: mesh, materials: [material])
+        let body = ModelEntity()
+        body.addChild(visual)
         configurePhysics(body, shapes: shapes)
         return body
     }
@@ -207,6 +381,10 @@ final class SceneModel: ObservableObject {
         let anchor = AnchorEntity(world: position)
         anchor.addChild(body)
         arView.scene.addAnchor(anchor)
+
+        // Pop in: the visual grows from almost nothing while the physics body falls
+        if let visual = body.children.first { popIn(visual) }
+        selected = body
         Haptics.place()
 
         spawned.append(anchor)
@@ -214,10 +392,36 @@ final class SceneModel: ObservableObject {
         count = spawned.count
     }
 
+    /// Shrinks an entity to 1% and animates it back to its real size. Scales its offset too,
+    /// so a model whose centre was shifted onto the origin stays centred while it grows.
+    private func popIn(_ entity: Entity) {
+        let target = entity.transform
+        var start = target
+        start.scale = target.scale * 0.01
+        start.translation = target.translation * 0.01
+        entity.transform = start
+        entity.move(to: target, relativeTo: entity.parent, duration: 0.28, timingFunction: .easeOut)
+    }
+
     // MARK: Interaction
+
+    /// The spawned object whose centre is closest to a screen point, within `radius` points.
+    func object(near point: CGPoint, radius: CGFloat) -> ModelEntity? {
+        guard let arView else { return nil }
+        var best: ModelEntity?
+        var bestDistance = radius
+        for anchor in spawned {
+            guard let body = anchor.children.first as? ModelEntity,
+                  let p = arView.project(body.position(relativeTo: nil)) else { continue }
+            let d = hypot(p.x - point.x, p.y - point.y)
+            if d < bestDistance { best = body; bestDistance = d }
+        }
+        return best
+    }
 
     func flick(_ body: ModelEntity) {
         guard let arView else { return }
+        selected = body
 
         let z = arView.cameraTransform.matrix.columns.2
         var dir = -SIMD3<Float>(z.x, 0, z.z)
@@ -278,21 +482,14 @@ final class SceneModel: ObservableObject {
         guard let arView else { return }
 
         // Pick the object whose centre is closest to the ring, within 90 points
-        var best: ModelEntity?
-        var bestDistance: CGFloat = 90
-        for anchor in spawned {
-            guard let body = anchor.children.first as? ModelEntity,
-                  let p = arView.project(body.position(relativeTo: nil)) else { continue }
-            let d = hypot(p.x - point.x, p.y - point.y)
-            if d < bestDistance { best = body; bestDistance = d }
-        }
-        guard let body = best else { return }
+        guard let body = object(near: point, radius: 90) else { return }
 
         // Keep the object at the distance it already is from the camera
         let cameraPos = arView.cameraTransform.translation
         grabDistance = min(max(distance(cameraPos, body.position(relativeTo: nil)), 0.25), 2.0)
         grabVelocity = .zero
         grabbed = body
+        selected = body
         isHolding = true
 
         // Kinematic: moved by our code, ignores gravity
@@ -302,7 +499,7 @@ final class SceneModel: ObservableObject {
     }
 
     /// Called every frame (60 Hz) from the AR session delegate.
-    func updateGrab(dt: Float) {
+    private func updateGrab(dt: Float) {
         guard let arView, let body = grabbed else { return }
 
         // The object may have been removed by undo, clear, or the object cap
@@ -382,7 +579,7 @@ struct ControlOverlay: View {
                     }
                     .transition(.scale(scale: 0.92, anchor: .bottom).combined(with: .opacity))
                 }
-                StatusPill(count: model.count)
+                StatusPill(count: model.count, hint: model.status.hint)
                 PlaceButton(symbol: currentSymbol, isOpen: showPicker) {
                     setPicker(!showPicker)
                 }
@@ -430,9 +627,10 @@ struct PlaceButton: View {
 
 struct StatusPill: View {
     let count: Int
+    let hint: String
 
     var body: some View {
-        Text("\(count) \(count == 1 ? "object" : "objects")  ·  Tap to place")
+        Text("\(count) \(count == 1 ? "object" : "objects")  ·  \(hint)")
             .font(.footnote.weight(.medium))
             .padding(.horizontal, 14)
             .padding(.vertical, 7)
@@ -599,6 +797,7 @@ struct ARContainer: UIViewRepresentable {
     func makeUIView(context: Context) -> ARView {
         let view = ARView(frame: .zero)
         model.arView = view
+        model.installOverlays()
         view.session.delegate = context.coordinator
 
         let config = ARWorldTrackingConfiguration()
@@ -645,11 +844,12 @@ struct ARContainer: UIViewRepresentable {
 
         // Called by ARKit for every camera frame
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            // Move the held object every frame (60 Hz), between hand detections (15 Hz)
+            // Per-frame work (60 Hz): held object, reticle, status, selection ring
             let dt = Float(min(max(frame.timestamp - lastTimestamp, 0.001), 0.1))
             lastTimestamp = frame.timestamp
-            model.updateGrab(dt: dt)
+            model.updateFrame(frame, dt: dt)
 
+            // Hand detection runs separately, about 15 times a second
             guard model.handTracking, let view = model.arView else { return }
             tracker.process(frame: frame, viewSize: view.bounds.size) { [weak model] sample in
                 model?.apply(sample)
@@ -660,19 +860,15 @@ struct ARContainer: UIViewRepresentable {
             guard let view = model.arView else { return }
             let point = gesture.location(in: view)
 
-            // 1. Tap landed on one of our objects: flick it
-            if let body = view.entity(at: point) as? ModelEntity, body.name == "spawned" {
+            // 1. A tap on or near an object flicks it. The 60 pt margin means a near miss
+            //    flicks the object instead of dropping a new one on top of it.
+            if let body = model.object(near: point, radius: 60) {
                 model.flick(body)
                 return
             }
 
-            // 2. Otherwise raycast to a surface and spawn there
-            let hit = view.raycast(from: point, allowing: .existingPlaneGeometry, alignment: .horizontal).first
-                   ?? view.raycast(from: point, allowing: .estimatedPlane, alignment: .horizontal).first
-            guard let hit else { return }
-
-            let t = hit.worldTransform.columns.3
-            model.spawn(at: SIMD3<Float>(t.x, t.y, t.z))
+            // 2. Anywhere else places at the reticle (or buzzes if there is no surface yet)
+            model.placeAtReticle()
         }
     }
 }
