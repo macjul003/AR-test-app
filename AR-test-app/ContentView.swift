@@ -43,6 +43,8 @@ enum ModelIcon {
     }
 }
 
+private func lerp(_ a: Float, _ b: Float, _ t: Float) -> Float { a + (b - a) * t }
+
 // MARK: - Model (shared between SwiftUI and the AR view)
 
 enum SpawnShape: String, CaseIterable, Identifiable {
@@ -62,28 +64,12 @@ enum SpawnChoice: Hashable {
     case usdz(String)
 }
 
-/// What the app tells the user about the camera and the room.
-enum ScanStatus: Equatable {
-    case scanning              // tracking is fine, but no surface under the reticle yet
-    case ready                 // a surface is under the reticle
-    case limited(String)       // ARKit says tracking is degraded; the string is the reason
-
-    var hint: String {
-        switch self {
-        case .scanning: return "Move the phone to scan"
-        case .ready: return "Tap to place"
-        case .limited(let why): return why.isEmpty ? "Tracking limited" : "Tracking limited · \(why)"
-        }
-    }
-}
-
 final class SceneModel: ObservableObject {
     // What to spawn
     @Published var choice: SpawnChoice = .primitive(.cube)
     @Published var colorIndex = 0
     @Published var showMesh = true
     @Published private(set) var count = 0
-    @Published private(set) var status: ScanStatus = .scanning
 
     // Hand tracking (screen points)
     @Published var handTracking = false
@@ -107,170 +93,51 @@ final class SceneModel: ObservableObject {
     private var cache: [String: Entity] = [:]   // load from disk once, clone after
     private let maxObjects = 40
 
-    // Reticle, placement and selection (updated every frame, not published)
-    private var reticle: AnchorEntity?
-    private var selectionRing: AnchorEntity?
     private var selected: ModelEntity?
-    private var placementPosition: SIMD3<Float>?
+
+    // GLOW: the object the hand is pointing at, and one glow per object that has been pointed at
+    private var hovered: ModelEntity?
+    private var glows: [ObjectIdentifier: HoverGlow] = [:]
 
     // Grabbing
     private var grabbed: ModelEntity?
     private var grabPoint: CGPoint = .zero          // ring position on screen
     private var grabDistance: Float = 0.6           // metres from the camera
     private var grabVelocity = SIMD3<Float>.zero    // smoothed, for throwing
+    private static let throwEnabled = false         // false: letting go just lets the object settle
 
     var usesColor: Bool {
         if case .primitive = choice { return true }
         return false
     }
 
-    // MARK: Reticle and selection ring
-
-    /// A flat ring in the XZ plane, made of triangles. Drawn from both sides so it never disappears.
-    private static func ringMesh(inner: Float, outer: Float, segments: Int = 64) -> MeshResource {
-        var positions: [SIMD3<Float>] = []
-        var indices: [UInt32] = []
-        for i in 0..<segments {
-            let a = Float(i) / Float(segments) * 2 * .pi
-            positions.append(SIMD3<Float>(cos(a) * inner, 0, sin(a) * inner))   // even index: inner edge
-            positions.append(SIMD3<Float>(cos(a) * outer, 0, sin(a) * outer))   // odd index: outer edge
-        }
-        for i in 0..<segments {
-            let i0 = UInt32(i * 2)
-            let o0 = i0 + 1
-            let next = UInt32(((i + 1) % segments) * 2)
-            let i1 = next
-            let o1 = next + 1
-            // One quad = two triangles, added in both windings (visible from above and below)
-            indices += [i0, o0, o1, i0, o1, i1]
-            indices += [i0, o1, o0, i0, i1, o1]
-        }
-        var desc = MeshDescriptor(name: "ring")
-        desc.positions = MeshBuffer(positions)
-        desc.primitives = .triangles(indices)
-        return (try? MeshResource.generate(from: [desc])) ?? MeshResource.generateBox(size: 0.01)
-    }
-
-    /// Called once from makeUIView. Creates the two overlay entities, hidden until needed.
-    func installOverlays() {
-        guard let arView else { return }
-
-        // Reticle: a 12 cm ring, about the size of a cube
-        let reticleRing = ModelEntity(mesh: Self.ringMesh(inner: 0.052, outer: 0.06),
-                                      materials: [UnlitMaterial(color: .white)])
-        let reticleAnchor = AnchorEntity(world: .zero)
-        reticleAnchor.addChild(reticleRing)
-        reticleAnchor.isEnabled = false
-        arView.scene.addAnchor(reticleAnchor)
-        reticle = reticleAnchor
-
-        // Selection ring: radius 1, scaled to fit whichever object is selected
-        let selectionColor = UIColor(red: 1.0, green: 0.8, blue: 0.2, alpha: 1.0)
-        let ring = ModelEntity(mesh: Self.ringMesh(inner: 0.88, outer: 1.0),
-                               materials: [UnlitMaterial(color: selectionColor)])
-        let ringAnchor = AnchorEntity(world: .zero)
-        ringAnchor.addChild(ring)
-        ringAnchor.isEnabled = false
-        arView.scene.addAnchor(ringAnchor)
-        selectionRing = ringAnchor
-    }
+    /// Kept so ARContainer's call still compiles. Nothing to install now that the ring is gone.
+    func installOverlays() {}
 
     /// Called every frame (60 Hz) from the AR session delegate.
     func updateFrame(_ frame: ARFrame, dt: Float) {
         updateGrab(dt: dt)
-        updateReticle(frame: frame, dt: dt)
-        updateSelection()
+        updateGlows(dt: dt)            // GLOW
     }
 
-    private func updateReticle(frame: ARFrame, dt: Float) {
-        guard let arView, let reticle else { return }
-
-        // 1. How good is tracking right now?
-        var hit: ARRaycastResult?
-        var newStatus: ScanStatus
-
-        switch frame.camera.trackingState {
-        case .normal:
-            // 2. Tracking is fine: is there a surface under the middle of the screen?
-            let center = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
-            hit = arView.raycast(from: center, allowing: .existingPlaneGeometry, alignment: .horizontal).first
-               ?? arView.raycast(from: center, allowing: .estimatedPlane, alignment: .horizontal).first
-
-            // Ignore hits more than 3 m away: they are guesses and jitter badly
-            if let h = hit {
-                let c = frame.camera.transform.columns.3
-                let p = h.worldTransform.columns.3
-                let d = distance(SIMD3<Float>(c.x, c.y, c.z), SIMD3<Float>(p.x, p.y, p.z))
-                if d > 3 { hit = nil }
-            }
-            newStatus = hit == nil ? .scanning : .ready
-
-        case .limited(let reason):
-            switch reason {
-            case .initializing:       newStatus = .limited("starting up")
-            case .excessiveMotion:    newStatus = .limited("slow down")
-            case .insufficientFeatures: newStatus = .limited("low detail")
-            case .relocalizing:       newStatus = .limited("relocalizing")
-            @unknown default:         newStatus = .limited("")
-            }
-
-        case .notAvailable:
-            newStatus = .limited("")
-        }
-
-        // Publishing 60 times a second would redraw the UI constantly, so only on change
-        if status != newStatus { status = newStatus }
-
-        // 3. Move the reticle onto the surface
-        guard let hit else {
-            reticle.isEnabled = false
-            placementPosition = nil
-            return
-        }
-
-        let m = hit.worldTransform
-        let surface = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
-        let lifted = surface + SIMD3<Float>(0, 0.003, 0)       // 3 mm up, so it doesn't z-fight the surface
-
-        if reticle.isEnabled {
-            let k = 1 - exp(-dt * 20)                           // glide instead of jitter
-            reticle.position = reticle.position + (lifted - reticle.position) * k
-        } else {
-            reticle.position = lifted                           // first frame: snap, don't glide from the origin
-        }
-        reticle.orientation = Transform(matrix: m).rotation
-        reticle.scale = SIMD3<Float>(repeating: 1 + 0.05 * sin(Float(frame.timestamp) * 4))   // gentle pulse
-        reticle.isEnabled = true
-
-        placementPosition = surface
-    }
-
-    private func updateSelection() {
-        guard let selectionRing else { return }
-        // The object may have been removed by undo, clear, or the object cap
-        guard let body = selected, body.scene != nil else {
-            selected = nil
-            selectionRing.isEnabled = false
-            return
-        }
-
-        // Put a ring on the ground under the object, sized to its footprint
-        let b = body.visualBounds(relativeTo: nil)
-        let radius = max(b.extents.x, b.extents.z) * 0.75 + 0.01
-        selectionRing.position = SIMD3<Float>(b.center.x, b.center.y - b.extents.y / 2 + 0.004, b.center.z)
-        selectionRing.scale = SIMD3<Float>(repeating: radius)
-        selectionRing.isEnabled = true
+    func select(_ body: ModelEntity) {
+        selected = body
+        Haptics.select()
     }
 
     // MARK: Spawning
 
-    /// Called by a tap that isn't on an object. Places at the reticle, or warns if there's no surface.
-    func placeAtReticle() {
-        guard let position = placementPosition else {
+    /// A tap that isn't on an object: raycast to a surface at the finger and place there.
+    func place(at point: CGPoint) {
+        guard let arView else { return }
+        let hit = arView.raycast(from: point, allowing: .existingPlaneGeometry, alignment: .horizontal).first
+               ?? arView.raycast(from: point, allowing: .estimatedPlane, alignment: .horizontal).first
+        guard let hit else {
             Haptics.warn()
             return
         }
-        spawn(at: position)
+        let t = hit.worldTransform.columns.3
+        spawn(at: SIMD3<Float>(t.x, t.y, t.z))
     }
 
     func spawn(at position: SIMD3<Float>) {
@@ -293,7 +160,7 @@ final class SceneModel: ObservableObject {
         body.physicsBody = PhysicsBodyComponent(
             shapes: shapes,
             mass: 0.5,
-            material: .generate(friction: 0.6, restitution: 0.4),
+            material: .generate(friction: 0.8, restitution: 0.05),   // grippy, almost no bounce
             mode: .dynamic
         )
     }
@@ -373,16 +240,16 @@ final class SceneModel: ObservableObject {
     private func add(_ body: ModelEntity, at position: SIMD3<Float>) {
         guard let arView else { return }
 
-        // Drop from above, slightly tilted so it tumbles on landing
-        body.position.y = 0.4
-        body.orientation = simd_quatf(angle: .random(in: 0...(.pi / 2)),
-                                      axis: normalize(SIMD3<Float>(1, 0, 1)))
+        // Appear exactly where you tapped: the object's lowest point rests 5 mm above the surface
+        // (measured before the pop-in shrinks it), no height, no tilt
+        let b = body.visualBounds(relativeTo: body)
+        body.position.y = -b.min.y + 0.005
 
         let anchor = AnchorEntity(world: position)
         anchor.addChild(body)
         arView.scene.addAnchor(anchor)
 
-        // Pop in: the visual grows from almost nothing while the physics body falls
+        // Pop in: the visual grows from almost nothing
         if let visual = body.children.first { popIn(visual) }
         selected = body
         Haptics.place()
@@ -419,6 +286,7 @@ final class SceneModel: ObservableObject {
         return best
     }
 
+    /// Not used right now (a tap selects instead). Kept so it can be switched back on.
     func flick(_ body: ModelEntity) {
         guard let arView else { return }
         selected = body
@@ -457,7 +325,11 @@ final class SceneModel: ObservableObject {
         isPinching = sample?.pinching ?? false
 
         // Hand lost: drop whatever we're holding, with no throw
-        guard let sample else { endGrab(throwing: false); return }
+        guard let sample else {
+            endGrab(throwing: false)
+            hovered = nil                                  // GLOW
+            return
+        }
 
         let mid = CGPoint(x: (sample.thumb.x + sample.index.x) / 2,
                           y: (sample.thumb.y + sample.index.y) / 2)
@@ -469,6 +341,8 @@ final class SceneModel: ObservableObject {
         } else {
             endGrab(throwing: true)
         }
+
+        updateHover(at: mid)                               // GLOW
     }
 
     func toggleHandTracking() {
@@ -498,7 +372,7 @@ final class SceneModel: ObservableObject {
         Haptics.place()
     }
 
-    /// Called every frame (60 Hz) from the AR session delegate.
+    /// Called every frame (60 Hz) from updateFrame.
     private func updateGrab(dt: Float) {
         guard let arView, let body = grabbed else { return }
 
@@ -522,13 +396,152 @@ final class SceneModel: ObservableObject {
         grabbed = nil
         isHolding = false
 
-        var velocity: SIMD3<Float> = throwing ? grabVelocity : .zero
+        var velocity: SIMD3<Float> = (throwing && Self.throwEnabled) ? grabVelocity : .zero
         let speed = length(velocity)
         if speed > 4 { velocity *= 4 / speed }   // clamp at 4 m/s
 
         body.physicsBody?.mode = .dynamic
         body.physicsMotion = PhysicsMotionComponent(linearVelocity: velocity, angularVelocity: .zero)
         Haptics.tap()
+    }
+
+    // MARK: GLOW (hover and grab feedback for hand tracking)
+    // To remove the feature: delete this section, the HoverGlow class below, and the lines marked GLOW.
+
+    /// Picks which object the hand is pointing at. Runs at the 15 Hz hand-detection rate.
+    private func updateHover(at point: CGPoint) {
+        // Holding something: that is the glowing object
+        if let held = grabbed { hovered = held; return }
+
+        // Pinching with nothing in hand (the pinch started away from an object): no glow
+        if isPinching { hovered = nil; return }
+
+        // Hysteresis: stay on the current target until the hand is 120 pt away,
+        // but only pick a new one inside 90 pt, so the glow doesn't flicker at the edge
+        if let current = hovered, current.scene != nil,
+           let p = arView?.project(current.position(relativeTo: nil)),
+           hypot(p.x - point.x, p.y - point.y) < 120 {
+            return
+        }
+        hovered = object(near: point, radius: 90)
+    }
+
+    /// Runs every frame so the glow fades smoothly between the 15 Hz hand updates.
+    private func updateGlows(dt: Float) {
+        // Build an object's glow the first time the hand points at it
+        if let h = hovered, h.scene != nil, glows[ObjectIdentifier(h)] == nil {
+            glows[ObjectIdentifier(h)] = HoverGlow(for: h)
+        }
+
+        for (id, glow) in glows {
+            guard let body = glow.body, body.scene != nil else {
+                glows[id] = nil                           // the object was removed
+                continue
+            }
+            glow.update(hovering: body === hovered, holding: body === grabbed, dt: dt)
+        }
+    }
+}
+
+// MARK: - HoverGlow
+
+/// A soft glow around one object, made of two slightly larger copies of it (shells).
+/// Only the shells' back faces are drawn, so the real object hides the middle and what
+/// shows is a rim around its silhouette. Hovering = wide, faint rim. Holding = tight, nearly solid.
+final class HoverGlow {
+    weak var body: ModelEntity?
+
+    private let outer: Entity
+    private let inner: Entity
+    private let outerParts: [Entity]
+    private let innerParts: [Entity]
+    private let half: SIMD3<Float>      // half the object's size, used to give the rim an even thickness
+    private var hover: Float = 0        // 0...1, how visible the glow is
+    private var hold: Float = 0         // 0...1, how much it has tightened toward a grab
+
+    private static let cool: (Float, Float, Float) = (0.72, 0.88, 1.00)   // hovering: cool white
+    private static let warm: (Float, Float, Float) = (1.00, 0.62, 0.20)   // holding: orange, like the hand ring
+
+    init?(for body: ModelEntity) {
+        guard let visual = body.children.first else { return nil }
+        self.body = body
+
+        let b = body.visualBounds(relativeTo: body)
+        half = SIMD3<Float>(max(b.extents.x / 2, 0.01),
+                            max(b.extents.y / 2, 0.01),
+                            max(b.extents.z / 2, 0.01))
+
+        let o = Self.makeShell(copying: visual, into: body)
+        let i = Self.makeShell(copying: visual, into: body)
+        outer = o.shell
+        outerParts = o.parts
+        inner = i.shell
+        innerParts = i.parts
+    }
+
+    /// Copies the object's visual into a hidden wrapper, and lists every part that has a mesh.
+    private static func makeShell(copying source: Entity, into parent: Entity) -> (shell: Entity, parts: [Entity]) {
+        let shell = Entity()
+        let copy = source.clone(recursive: true)
+        shell.addChild(copy)
+        parent.addChild(shell)
+        shell.isEnabled = false
+
+        var parts: [Entity] = []
+        func collect(_ e: Entity) {
+            if e.components[ModelComponent.self] != nil { parts.append(e) }
+            for child in e.children { collect(child) }
+        }
+        collect(copy)
+        return (shell, parts)
+    }
+
+    private static func material(red: Float, green: Float, blue: Float, alpha: Float) -> UnlitMaterial {
+        var m = UnlitMaterial(color: UIColor(red: CGFloat(red), green: CGFloat(green),
+                                             blue: CGFloat(blue), alpha: 1))
+        m.faceCulling = .front                                           // draw only the back faces
+        m.blending = .transparent(opacity: .init(floatLiteral: alpha))   // see-through
+        return m
+    }
+
+    func update(hovering: Bool, holding: Bool, dt: Float) {
+        // Fade in fast (about 150 ms), out slower (about 250 ms)
+        let active = hovering || holding
+        let rate = 1 - exp(-dt * (active ? 14 : 8))
+        hover += ((active ? 1 : 0) - hover) * rate
+        hold += ((holding ? 1 : 0) - hold) * rate
+
+        guard hover > 0.01 else {
+            outer.isEnabled = false
+            inner.isEnabled = false
+            return
+        }
+        outer.isEnabled = true
+        inner.isEnabled = true
+
+        let c = Self.cool, w = Self.warm
+        let r = lerp(c.0, w.0, hold), g = lerp(c.1, w.1, hold), b = lerp(c.2, w.2, hold)
+
+        // Hover: wide and faint. Hold: tight and nearly solid.
+        apply(to: outer, parts: outerParts,
+              thickness: lerp(0.014, 0.008, hold), alpha: lerp(0.20, 0.40, hold) * hover,
+              red: r, green: g, blue: b)
+        apply(to: inner, parts: innerParts,
+              thickness: lerp(0.007, 0.0035, hold), alpha: lerp(0.35, 0.92, hold) * hover,
+              red: r, green: g, blue: b)
+    }
+
+    private func apply(to shell: Entity, parts: [Entity], thickness t: Float, alpha: Float,
+                       red: Float, green: Float, blue: Float) {
+        // Per-axis scale so the rim is about `t` metres thick on every side
+        shell.scale = SIMD3<Float>(1 + t / half.x, 1 + t / half.y, 1 + t / half.z)
+
+        let m = Self.material(red: red, green: green, blue: blue, alpha: alpha)
+        for part in parts {
+            guard var model = part.components[ModelComponent.self] else { continue }
+            model.materials = Array(repeating: m, count: max(model.materials.count, 1))
+            part.components.set(model)
+        }
     }
 }
 
@@ -579,7 +592,6 @@ struct ControlOverlay: View {
                     }
                     .transition(.scale(scale: 0.92, anchor: .bottom).combined(with: .opacity))
                 }
-                StatusPill(count: model.count, hint: model.status.hint)
                 PlaceButton(symbol: currentSymbol, isOpen: showPicker) {
                     setPicker(!showPicker)
                 }
@@ -602,7 +614,7 @@ struct ControlOverlay: View {
     }
 }
 
-// MARK: - Place button + status
+// MARK: - Place button
 
 struct PlaceButton: View {
     let symbol: String
@@ -622,19 +634,6 @@ struct PlaceButton: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Choose what to place")
-    }
-}
-
-struct StatusPill: View {
-    let count: Int
-    let hint: String
-
-    var body: some View {
-        Text("\(count) \(count == 1 ? "object" : "objects")  ·  \(hint)")
-            .font(.footnote.weight(.medium))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-            .background(.ultraThinMaterial, in: Capsule())
     }
 }
 
@@ -844,7 +843,7 @@ struct ARContainer: UIViewRepresentable {
 
         // Called by ARKit for every camera frame
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            // Per-frame work (60 Hz): held object, reticle, status, selection ring
+            // Per-frame work (60 Hz): held object, status hint, glow, selection ring
             let dt = Float(min(max(frame.timestamp - lastTimestamp, 0.001), 0.1))
             lastTimestamp = frame.timestamp
             model.updateFrame(frame, dt: dt)
@@ -860,15 +859,15 @@ struct ARContainer: UIViewRepresentable {
             guard let view = model.arView else { return }
             let point = gesture.location(in: view)
 
-            // 1. A tap on or near an object flicks it. The 60 pt margin means a near miss
-            //    flicks the object instead of dropping a new one on top of it.
+            // 1. A tap on or near an object selects it. The 60 pt margin means a near miss
+            //    selects the object instead of placing a new one on top of it.
             if let body = model.object(near: point, radius: 60) {
-                model.flick(body)
+                model.select(body)
                 return
             }
 
-            // 2. Anywhere else places at the reticle (or buzzes if there is no surface yet)
-            model.placeAtReticle()
+            // 2. Anywhere else: the object appears where you tapped
+            model.place(at: point)
         }
     }
 }
