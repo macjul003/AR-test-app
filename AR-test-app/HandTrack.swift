@@ -46,7 +46,7 @@ final class HandTracker {
             }
         }
     }
-    
+
     private func detect(buffer: CVPixelBuffer, transform: CGAffineTransform, viewSize: CGSize) -> HandSample? {
         // .right tells Vision the sensor image must be rotated to be upright (portrait)
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .right, options: [:])
@@ -83,7 +83,8 @@ final class HandTracker {
     }
 }
 
-/// Debug overlay: dots on the fingertips, a ring between them that turns green on pinch.
+/// Overlay: dots on the fingertips, a ring between them.
+/// White = open, green = pinching, orange = holding an object.
 struct HandCursor: View {
     @ObservedObject var model: SceneModel
 

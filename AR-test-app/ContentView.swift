@@ -1,7 +1,47 @@
 import SwiftUI
+import UIKit
 import RealityKit
 import ARKit
 import Combine
+
+// MARK: - Root
+
+struct ContentView: View {
+    @StateObject private var model = SceneModel()
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            ARContainer(model: model).ignoresSafeArea()
+            HandCursor(model: model)
+            ControlOverlay(model: model)
+        }
+    }
+}
+
+// MARK: - Helpers
+
+enum Haptics {
+    static func select() { UISelectionFeedbackGenerator().selectionChanged() }
+    static func tap()    { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+    /// Call this where the app actually drops an object into the scene.
+    static func place()  { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
+    static func warn()   { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
+}
+
+enum ModelIcon {
+    /// SF Symbol for a model, keyed off its filename. Unknown models get a generic icon.
+    static func symbol(for name: String) -> String {
+        let n = name.lowercased()
+        if n.contains("fender") || n.contains("guitar") { return "guitars" }
+        if n.contains("toy") || n.contains("plane")     { return "airplane" }
+        return "cube.transparent"
+    }
+
+    /// Models that should not appear in the picker.
+    static func isHidden(_ name: String) -> Bool {
+        name.lowercased().contains("hab")
+    }
+}
 
 // MARK: - Model (shared between SwiftUI and the AR view)
 
@@ -34,12 +74,7 @@ final class SceneModel: ObservableObject {
     @Published var thumbPoint: CGPoint?
     @Published var indexPoint: CGPoint?
     @Published var isPinching = false
-    
     @Published var isHolding = false
-    private var grabbed: ModelEntity?
-    private var grabPoint: CGPoint = .zero          // ring position on screen
-    private var grabDistance: Float = 0.6           // metres from the camera
-    private var grabVelocity = SIMD3<Float>.zero    // smoothed, for throwing
 
     let palette: [Color] = [.blue, .orange, .pink, .green, .white]
 
@@ -55,6 +90,12 @@ final class SceneModel: ObservableObject {
     private var spawned: [AnchorEntity] = []
     private var cache: [String: Entity] = [:]   // load from disk once, clone after
     private let maxObjects = 40
+
+    // Grabbing
+    private var grabbed: ModelEntity?
+    private var grabPoint: CGPoint = .zero          // ring position on screen
+    private var grabDistance: Float = 0.6           // metres from the camera
+    private var grabVelocity = SIMD3<Float>.zero    // smoothed, for throwing
 
     var usesColor: Bool {
         if case .primitive = choice { return true }
@@ -166,6 +207,7 @@ final class SceneModel: ObservableObject {
         let anchor = AnchorEntity(world: position)
         anchor.addChild(body)
         arView.scene.addAnchor(anchor)
+        Haptics.place()
 
         spawned.append(anchor)
         if spawned.count > maxObjects { spawned.removeFirst().removeFromParent() }
@@ -187,7 +229,7 @@ final class SceneModel: ObservableObject {
                                               Float.random(in: -0.004...0.004),
                                               Float.random(in: -0.004...0.004)),
                                  relativeTo: nil)
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        Haptics.tap()
     }
 
     func undo() {
@@ -225,6 +267,13 @@ final class SceneModel: ObservableObject {
         }
     }
 
+    func toggleHandTracking() {
+        handTracking.toggle()
+        if !handTracking { apply(nil) }
+    }
+
+    // MARK: Grabbing
+
     private func beginGrab(at point: CGPoint) {
         guard let arView else { return }
 
@@ -249,7 +298,7 @@ final class SceneModel: ObservableObject {
         // Kinematic: moved by our code, ignores gravity
         body.physicsBody?.mode = .kinematic
         body.physicsMotion = PhysicsMotionComponent(linearVelocity: .zero, angularVelocity: .zero)
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        Haptics.place()
     }
 
     /// Called every frame (60 Hz) from the AR session delegate.
@@ -282,112 +331,263 @@ final class SceneModel: ObservableObject {
 
         body.physicsBody?.mode = .dynamic
         body.physicsMotion = PhysicsMotionComponent(linearVelocity: velocity, angularVelocity: .zero)
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    }
-
-    func toggleHandTracking() {
-        handTracking.toggle()
-        if !handTracking { apply(nil) }
+        Haptics.tap()
     }
 }
 
-// MARK: - SwiftUI
+// MARK: - Overlay (place button, popup, rail)
 
-struct ContentView: View {
-    @StateObject private var model = SceneModel()
-
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            ARContainer(model: model).ignoresSafeArea()
-            HandCursor(model: model)
-            ControlTray(model: model)
-        }
-    }
-}
-
-struct ControlTray: View {
+struct ControlOverlay: View {
     @ObservedObject var model: SceneModel
+    @State private var showPicker = false
+    @State private var confirmClear = false
 
-    private func chip<Content: View>(selected: Bool, @ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(.horizontal, 12)
-            .frame(minWidth: 44, minHeight: 44)
-            .background(selected ? Color.white.opacity(0.25) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 12))
+    private var visibleModels: [String] {
+        model.modelNames.filter { !ModelIcon.isHidden($0) }
+    }
+
+    private var currentSymbol: String {
+        if case .primitive(let s) = model.choice { return s.icon }
+        if case .usdz(let name) = model.choice { return ModelIcon.symbol(for: name) }
+        return "plus"
+    }
+
+    private func setPicker(_ open: Bool) {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { showPicker = open }
+        Haptics.tap()
     }
 
     var body: some View {
-        VStack(spacing: 14) {
-            // Row 1: what to spawn
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(SpawnShape.allCases) { s in
-                        Button { model.choice = .primitive(s) } label: {
-                            chip(selected: model.choice == .primitive(s)) {
-                                Image(systemName: s.icon).font(.title3)
-                            }
-                        }
-                    }
-                    if !model.modelNames.isEmpty {
-                        Divider().frame(height: 24)
-                    }
-                    ForEach(model.modelNames, id: \.self) { name in
-                        Button { model.choice = .usdz(name) } label: {
-                            chip(selected: model.choice == .usdz(name)) {
-                                Text(name.replacingOccurrences(of: "_", with: " "))
-                                    .font(.footnote.weight(.medium))
-                                    .lineLimit(1)
-                            }
-                        }
-                    }
-                }
+        ZStack {
+            // Tap outside the popup to close it. While open, this also stops
+            // stray taps from placing an object behind the popup.
+            if showPicker {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture { setPicker(false) }
             }
 
-            // Row 2: color and actions
-            HStack(spacing: 14) {
-                ForEach(model.palette.indices, id: \.self) { i in
-                    Circle()
-                        .fill(model.palette[i])
-                        .frame(width: 30, height: 30)
-                        .overlay(
-                            Circle()
-                                .stroke(Color.white, lineWidth: model.colorIndex == i ? 3 : 0)
-                                .padding(-5)
-                        )
-                        .onTapGesture { model.colorIndex = i }
-                }
-                .opacity(model.usesColor ? 1 : 0.3)
-                .allowsHitTesting(model.usesColor)
+            // Top-right rail
+            ActionRail(model: model, confirmClear: $confirmClear)
+                .padding(.top, 8)
+                .padding(.trailing, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
 
-                Spacer()
-
-                Button { model.toggleHandTracking() } label: {
-                    Image(systemName: model.handTracking ? "hand.raised.fill" : "hand.raised")
-                        .frame(width: 44, height: 44)
+            // Bottom: popup, status, place button
+            VStack(spacing: 12) {
+                if showPicker {
+                    PickerPopup(model: model, visibleModels: visibleModels) {
+                        setPicker(false)
+                    }
+                    .transition(.scale(scale: 0.92, anchor: .bottom).combined(with: .opacity))
                 }
-                Button { model.showMesh.toggle() } label: {
-                    Image(systemName: model.showMesh ? "eye" : "eye.slash").frame(width: 44, height: 44)
+                StatusPill(count: model.count)
+                PlaceButton(symbol: currentSymbol, isOpen: showPicker) {
+                    setPicker(!showPicker)
                 }
-                Button { model.undo() } label: {
-                    Image(systemName: "arrow.uturn.backward").frame(width: 44, height: 44)
-                }
-                .disabled(model.count == 0)
-                Button { model.clear() } label: {
-                    Image(systemName: "trash").frame(width: 44, height: 44)
-                }
-                .disabled(model.count == 0)
             }
-
-            Text("\(model.count) objects  ·  tap a surface to drop  ·  tap an object to flick")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
-        .padding(16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
-        .padding(.horizontal, 16)
-        .padding(.bottom, 8)
         .foregroundStyle(.white)
         .environment(\.colorScheme, .dark)
+        .confirmationDialog("Remove all objects?",
+                            isPresented: $confirmClear,
+                            titleVisibility: .visible) {
+            Button("Remove all", role: .destructive) {
+                model.clear()
+                Haptics.warn()
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+}
+
+// MARK: - Place button + status
+
+struct PlaceButton: View {
+    let symbol: String
+    let isOpen: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.title2)
+                .frame(width: 64, height: 64)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(
+                    Circle().stroke(Color.white.opacity(isOpen ? 0.9 : 0.35),
+                                    lineWidth: isOpen ? 2.5 : 1.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Choose what to place")
+    }
+}
+
+struct StatusPill: View {
+    let count: Int
+
+    var body: some View {
+        Text("\(count) \(count == 1 ? "object" : "objects")  ·  Tap to place")
+            .font(.footnote.weight(.medium))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+}
+
+// MARK: - Picker popup
+
+struct PickerPopup: View {
+    @ObservedObject var model: SceneModel
+    let visibleModels: [String]
+    let onPick: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            // Shapes + models
+            HStack(spacing: 8) {
+                ForEach(SpawnShape.allCases) { s in
+                    ChoiceChip(symbol: s.icon,
+                               label: String(describing: s).capitalized,
+                               selected: model.choice == .primitive(s)) {
+                        model.choice = .primitive(s)
+                        Haptics.select()
+                        onPick()
+                    }
+                }
+                if !visibleModels.isEmpty {
+                    Divider().frame(height: 28)
+                    ForEach(visibleModels, id: \.self) { name in
+                        ChoiceChip(symbol: ModelIcon.symbol(for: name),
+                                   label: name.replacingOccurrences(of: "_", with: " ").capitalized,
+                                   selected: model.choice == .usdz(name)) {
+                            model.choice = .usdz(name)
+                            Haptics.select()
+                            onPick()
+                        }
+                    }
+                }
+            }
+
+            // Colors (popup stays open while picking)
+            HStack(spacing: 8) {
+                ForEach(model.palette.indices, id: \.self) { i in
+                    let selected = model.colorIndex == i
+                    Button {
+                        model.colorIndex = i
+                        Haptics.select()
+                    } label: {
+                        Circle()
+                            .fill(model.palette[i])
+                            .frame(width: 30, height: 30)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.white, lineWidth: 3)
+                                    .padding(-5)
+                                    .opacity(selected ? 1 : 0)
+                            )
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Color \(i + 1)")
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                }
+            }
+            .opacity(model.usesColor ? 1 : 0.3)
+            .allowsHitTesting(model.usesColor)
+        }
+        .padding(14)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
+        .contentShape(RoundedRectangle(cornerRadius: 24))
+        .frame(maxWidth: 360)
+    }
+}
+
+struct ChoiceChip: View {
+    let symbol: String
+    let label: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.title3)
+                .frame(width: 48, height: 48)
+                .background(selected ? Color.white.opacity(0.28) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(selected ? 0.9 : 0), lineWidth: 1.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// MARK: - Top-right rail
+
+struct ActionRail: View {
+    @ObservedObject var model: SceneModel
+    @Binding var confirmClear: Bool
+
+    var body: some View {
+        VStack(spacing: 4) {
+            RailButton(symbol: model.handTracking ? "hand.raised.fill" : "hand.raised",
+                       label: "Hand tracking",
+                       active: model.handTracking) {
+                model.toggleHandTracking()
+                Haptics.tap()
+            }
+            RailButton(symbol: model.showMesh ? "eye" : "eye.slash",
+                       label: "Scene mesh",
+                       active: model.showMesh) {
+                model.showMesh.toggle()
+                Haptics.tap()
+            }
+            RailButton(symbol: "arrow.uturn.backward",
+                       label: "Undo",
+                       enabled: model.count > 0) {
+                model.undo()
+                Haptics.tap()
+            }
+            RailButton(symbol: "trash",
+                       label: "Clear all",
+                       enabled: model.count > 0) {
+                confirmClear = true
+            }
+        }
+        .padding(6)
+        .background(.ultraThinMaterial, in: Capsule())
+    }
+}
+
+struct RailButton: View {
+    let symbol: String
+    let label: String
+    var active = false
+    var enabled = true
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.body.weight(.medium))
+                .frame(width: 44, height: 44)
+                .background(active ? Color.white.opacity(0.25) : Color.clear, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
+        .accessibilityLabel(label)
     }
 }
 
